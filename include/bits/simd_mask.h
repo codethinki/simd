@@ -160,6 +160,69 @@ namespace simd
     { return __v[__indices]; }
 #endif
 
+  // [simd.permute.mask]
+  template<__simd_vec_or_mask_type _Vp, typename _Mp>
+    constexpr _Vp
+    __compress(const _Vp& __v, const _Mp& __selector, const typename _Vp::value_type& __fill_value)
+    {
+      __simd_size_type __bit_index[_Vp::size()] = {};
+      __simd_size_type __n = 0;
+      for (__simd_size_type __i = 0; __i < _Vp::size(); ++__i)
+	if (__selector[__i])
+	  __bit_index[__n++] = __i;
+      return _Vp([&](__simd_size_type __i) -> typename _Vp::value_type {
+	       return __i < __n ? __v[__bit_index[__i]] : __fill_value;
+	     });
+    }
+
+  template<__simd_vec_or_mask_type _Vp, typename _Mp>
+    constexpr _Vp
+    __expand(const _Vp& __v, const _Mp& __selector, const _Vp& __original)
+    {
+      __simd_size_type __bit_lookup[_Vp::size()] = {};
+      __simd_size_type __n = 0;
+      for (__simd_size_type __i = 0; __i < _Vp::size(); ++__i)
+	{
+	  __bit_lookup[__i] = __n;
+	  __n += __selector[__i];
+	}
+      return _Vp([&](__simd_size_type __i) -> typename _Vp::value_type {
+	       return __selector[__i] ? __v[__bit_lookup[__i]] : __original[__i];
+	     });
+    }
+
+  template<__simd_vec_type _Vp>
+    constexpr _Vp
+    compress(const _Vp& __v, const typename _Vp::mask_type& __selector)
+    { return __compress(__v, __selector, typename _Vp::value_type()); }
+
+  template<__simd_mask_type _Vp>
+    constexpr _Vp
+    compress(const _Vp& __v, const type_identity_t<_Vp>& __selector)
+    { return __compress(__v, __selector, false); }
+
+  template<__simd_vec_type _Vp>
+    constexpr _Vp
+    compress(const _Vp& __v, const typename _Vp::mask_type& __selector,
+	     const typename _Vp::value_type& __fill_value)
+    { return __compress(__v, __selector, __fill_value); }
+
+  template<__simd_mask_type _Vp>
+    constexpr _Vp
+    compress(const _Vp& __v, const type_identity_t<_Vp>& __selector,
+	     const typename _Vp::value_type& __fill_value)
+    { return __compress(__v, __selector, __fill_value); }
+
+  template<__simd_vec_type _Vp>
+    constexpr _Vp
+    expand(const _Vp& __v, const typename _Vp::mask_type& __selector, const _Vp& __original = {})
+    { return __expand(__v, __selector, __original); }
+
+  template<__simd_mask_type _Vp>
+    constexpr _Vp
+    expand(const _Vp& __v, const type_identity_t<_Vp>& __selector, const _Vp& __original = {})
+    { return __expand(__v, __selector, __original); }
+
   // [simd.creation] ----------------------------------------------------------
   template<__simd_vec_type _Vp, typename _Ap>
     [[__gnu__::__always_inline__]]
