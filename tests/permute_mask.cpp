@@ -48,6 +48,36 @@ template <typename V>
       }
     };
 
+    // irregular masks, the reference is a plain loop over the elements
+    static constexpr unsigned long long patterns[]
+      = {0x5a3c'96e1'0f87'd24bull, 0x8000'0001'4000'0002ull, 0x0123'4567'89ab'cdefull,
+	 0xfedc'ba98'7654'3210ull, 0x7fff'fffe'ffff'fffdull};
+
+    ADD_TEST(compress_expand_patterns) {
+      std::tuple {iota, V(fill)},
+      [](auto& t, V x, V orig) {
+	for (unsigned long long bits : patterns)
+	  {
+	    const M k([&](int i) { return ((bits >> (i % 64)) & 1) != 0; });
+	    T compressed[V::size()] = {};
+	    T expanded[V::size()] = {};
+	    int n = 0;
+	    for (int i = 0; i < V::size(); ++i)
+	      if (k[i])
+		compressed[n++] = x[i];
+	    int m = 0;
+	    for (int i = 0; i < V::size(); ++i)
+	      expanded[i] = k[i] ? x[m++] : orig[i];
+	    t.verify_equal(simd::compress(x, k, fill),
+			   V([&](int i) { return i < n ? compressed[i] : fill; }));
+	    t.verify_equal(select(M([&](int i) { return i < n; }), simd::compress(x, k), V(fill)),
+			   V([&](int i) { return i < n ? compressed[i] : fill; }));
+	    t.verify_equal(simd::expand(x, k, orig), V([&](int i) { return expanded[i]; }));
+	    t.verify_equal(simd::compress(k, k, false), M([&](int i) { return i < n; }));
+	  }
+      }
+    };
+
     ADD_TEST(compress_expand_mask) {
       std::tuple {odd, M(true), M(false), first},
       [](auto& t, M k, M all, M none, M k0) {

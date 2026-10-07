@@ -1573,6 +1573,391 @@ namespace simd
 	}
 #endif
     }
+
+  /** @internal
+   * How __x86_compress and __x86_expand implement @p _TV.
+   */
+  enum class _X86CompressImpl
+  {
+    _S_none,
+    // compress/expand instructions (VBMI2 for 1- and 2-byte elements)
+    _S_avx512,
+    // 4- and 8-byte elements with VPERMD (AVX2) or PSHUFB (SSSE3), indices from 16-entry tables
+    _S_permute,
+    // 1- and 2-byte elements with PEXT/PDEP, 8 bytes at a time (microcoded and slow on Zen 1/2)
+    _S_bmi2,
+  };
+
+  template <__vec_builtin _TV, _ArchTraits _Traits = {}>
+    consteval _X86CompressImpl
+    __x86_compress_impl()
+    {
+      constexpr size_t __bytes = sizeof(_TV) < 16 ? 16 : sizeof(_TV);
+      constexpr size_t __s = sizeof(__vec_value_type<_TV>);
+      if constexpr (__bytes > 64)
+	return _X86CompressImpl::_S_none;
+      else if constexpr ((__bytes == 64 || _Traits._M_have_avx512vl())
+			   && (__s >= 4 ? _Traits._M_have_avx512f()
+					: _Traits._M_have_avx512vbmi2()))
+	return _X86CompressImpl::_S_avx512;
+      else if constexpr (__s >= 4 && ((__bytes <= 32 && _Traits._M_have_avx2())
+					|| (__bytes == 16 && _Traits._M_have_ssse3())))
+	return _X86CompressImpl::_S_permute;
+#if __has_builtin(__builtin_ia32_pext_di) && __has_builtin(__builtin_ia32_pdep_di) \
+      && !defined __znver1__ && !defined __znver2__ \
+      && !defined __tune_znver1__ && !defined __tune_znver2__
+      else if constexpr (_Traits._M_have_bmi2())
+	return _X86CompressImpl::_S_bmi2;
+#endif
+      else
+	return _X86CompressImpl::_S_none;
+    }
+
+  /** @internal
+   * Entry @c k holds the indices of the set bits of the 4-bit mask @c k, one per nibble, packed to
+   * the front.
+   */
+  inline constexpr auto __x86_compress_nibbles = [] {
+    array<unsigned short, 16> __lut = {};
+    for (unsigned __k = 0; __k < 16; ++__k)
+      {
+	unsigned __n = 0;
+	for (unsigned __i = 0; __i < 4; ++__i)
+	  if ((__k >> __i) & 1)
+	    __lut[__k] |= __i << (4 * __n++);
+      }
+    return __lut;
+  }();
+
+  /** @internal
+   * Nibble @c i of entry @c k is the number of set bits of the 4-bit mask @c k below bit @c i.
+   */
+  inline constexpr auto __x86_expand_nibbles = [] {
+    array<unsigned short, 16> __lut = {};
+    for (unsigned __k = 0; __k < 16; ++__k)
+      for (unsigned __i = 0; __i < 4; ++__i)
+	__lut[__k] |= __builtin_popcount(__k & ((1u << __i) - 1)) << (4 * __i);
+    return __lut;
+  }();
+
+  /** @internal
+   * Doubles every bit of the 4-bit mask @p __k: the mask of 8-byte elements becomes the mask of
+   * their 4-byte halves.
+   */
+  constexpr unsigned
+  __x86_dup_mask_bits(unsigned __k)
+  {
+    __k = (__k | (__k << 2)) & 0x33u;
+    __k = (__k | (__k << 1)) & 0x55u;
+    return __k * 3u;
+  }
+
+  /** @internal
+   * Index nibbles for permuting the 4-byte elements of a vector: nibble @c i is the index of the
+   * element that goes to element @c i.
+   */
+  template <bool _Compress, int _Lanes>
+    constexpr unsigned
+    __x86_permute_nibbles(unsigned __kd)
+    {
+      const unsigned __n_lo = __builtin_popcount(__kd & 0xfu);
+      if constexpr (_Lanes <= 4)
+	return _Compress ? __x86_compress_nibbles[__kd & 0xfu] : __x86_expand_nibbles[__kd & 0xfu];
+      else if constexpr (_Compress)
+	return __x86_compress_nibbles[__kd & 0xfu]
+		 | (unsigned(__x86_compress_nibbles[(__kd >> 4) & 0xfu]) + 0x4444u) << (4 * __n_lo);
+      else
+	return __x86_expand_nibbles[__kd & 0xfu]
+		 | (unsigned(__x86_expand_nibbles[(__kd >> 4) & 0xfu]) + 0x1111u * __n_lo) << 16;
+    }
+
+  template <bool _Compress, __vec_builtin _TV, _ArchTraits _Traits = {}>
+    [[__gnu__::__always_inline__]]
+    inline _TV
+    __x86_permute_by_mask(_TV __x, unsigned long long __k)
+    {
+      using _Tp = __vec_value_type<_TV>;
+      const unsigned __kd = sizeof(_Tp) == 8 ? __x86_dup_mask_bits(__k & 0xfu)
+					     : unsigned(__k & 0xffu);
+      const unsigned __nibbles = __x86_permute_nibbles<_Compress, sizeof(_TV) / 4>(__kd);
+#if __has_builtin(__builtin_ia32_permvarsi256)
+      if constexpr (_Traits._M_have_avx2())
+	{
+	  using _V8 = __vec_builtin_type<unsigned, 8>;
+	  const _V8 __idx = (_V8() + __nibbles) >> _V8{0, 4, 8, 12, 16, 20, 24, 28} & 0xfu;
+	  const auto __r = __builtin_ia32_permvarsi256(
+			     __vec_bit_cast<int>(__vec_zero_pad_to<32>(__x)),
+			     __vec_bit_cast<int>(__idx));
+	  return _VecOps<_TV>::_S_extract(__vec_bit_cast<_Tp>(__r));
+	}
+      else
+#endif
+	{ // SSSE3, 16 bytes: byte j of the result is byte 4 * nibble[j / 4] + j % 4
+	  static_assert(sizeof(_TV) == 16);
+	  using _V16 = __vec_builtin_type<unsigned char, 16>;
+	  // the 4 index nibbles as 4 bytes holding the index of the first byte, each repeated 4 times
+	  unsigned __bytes = (__nibbles | (__nibbles << 8)) & 0x00ff'00ffu;
+	  __bytes = ((__bytes | (__bytes << 4)) & 0x0f0f'0f0fu) << 2;
+	  const auto __first = __vec_bit_cast<unsigned char>(__builtin_ia32_pshufb128(
+				 __vec_bit_cast<char>(__vec_builtin_type<unsigned, 4>{__bytes, 0, 0, 0}),
+				 __vec_builtin_type<char, 16>{0, 0, 0, 0, 1, 1, 1, 1,
+							      2, 2, 2, 2, 3, 3, 3, 3}));
+	  const _V16 __idx = __first + _V16{0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+	  return __glibcxx_vec_bit_cast<_TV>(
+		   __builtin_ia32_pshufb128(__vec_bit_cast<char>(__x), __vec_bit_cast<char>(__idx)));
+	}
+    }
+
+#if __has_builtin(__builtin_ia32_pext_di) && __has_builtin(__builtin_ia32_pdep_di)
+  /** @internal
+   * @p __k with every bit repeated sizeof(_Tp) * 8 times, for the 8 / sizeof(_Tp) elements of a
+   * 64-bit chunk.
+   */
+  template <typename _Tp>
+    [[__gnu__::__always_inline__]]
+    inline unsigned long long
+    __x86_chunk_mask(unsigned __k)
+    {
+      if constexpr (sizeof(_Tp) == 1)
+	return __builtin_ia32_pdep_di(__k, 0x0101'0101'0101'0101ull) * 0xffu;
+      else
+	return __builtin_ia32_pdep_di(__k, 0x0001'0001'0001'0001ull) * 0xffffu;
+    }
+
+  template <bool _Compress, __vec_builtin _TV>
+    [[__gnu__::__always_inline__]]
+    inline _TV
+    __x86_bmi2_by_mask(_TV __x, unsigned long long __k)
+    {
+      using _Tp = __vec_value_type<_TV>;
+      using _U64 = unsigned long long;
+      constexpr int __per_chunk = 8 / sizeof(_Tp);
+      constexpr int __chunks = sizeof(_TV) / 8;
+      constexpr unsigned __chunk_k = (1u << __per_chunk) - 1;
+      constexpr auto [...__cs] = _IotaArray<__chunks>;
+      const unsigned __bits[__chunks] = {unsigned(__k >> (__cs * __per_chunk)) & __chunk_k...};
+      // byte offset of the first element of chunk c in the packed sequence
+      int __offset[__chunks] = {};
+      for (int __c = 1; __c < __chunks; ++__c)
+	__offset[__c] = __offset[__c - 1] + __builtin_popcount(__bits[__c - 1]) * int(sizeof(_Tp));
+      if constexpr (_Compress)
+	{
+	  const auto __chunk = __vec_bit_cast<_U64>(__x);
+	  unsigned char __out[sizeof(_TV) + 8] = {};
+	  (..., [&] {
+	    const _U64 __packed
+	      = __builtin_ia32_pext_di(__chunk[__cs], __x86_chunk_mask<_Tp>(__bits[__cs]));
+	    __builtin_memcpy(__out + __offset[__cs], &__packed, 8);
+	  }());
+	  _TV __r;
+	  __builtin_memcpy(&__r, __out, sizeof(_TV));
+	  return __r;
+	}
+      else
+	{
+	  unsigned char __in[sizeof(_TV) + 8] = {};
+	  __builtin_memcpy(__in, &__x, sizeof(_TV));
+	  const auto __load = [&](int __off) {
+	    _U64 __r;
+	    __builtin_memcpy(&__r, __in + __off, 8);
+	    return __r;
+	  };
+	  return __vec_bit_cast<_Tp>(__vec_builtin_type<_U64, __chunks>{
+		   __builtin_ia32_pdep_di(__load(__offset[__cs]),
+					  __x86_chunk_mask<_Tp>(__bits[__cs]))...});
+	}
+    }
+#endif
+
+  /** @internal
+   * Returns the elements of @p __x where bit @c i of @p __k is set, packed to the front. With
+   * _S_avx512 the remaining elements come from @p __src, otherwise they are unspecified.
+   */
+  template <__vec_builtin _TV, _ArchTraits _Traits = {}>
+    [[__gnu__::__always_inline__]]
+    inline _TV
+    __x86_compress(_TV __x, unsigned long long __k, _TV __src = _TV())
+    {
+      constexpr _X86CompressImpl __impl = __x86_compress_impl<_TV, _Traits>();
+      static_assert(__impl != _X86CompressImpl::_S_none);
+      using _Tp = __vec_value_type<_TV>;
+      if constexpr (sizeof(_TV) < 16)
+	return _VecOps<_TV>::_S_extract(
+		 __x86_compress<__vec_builtin_type_bytes<_Tp, 16>, _Traits>(
+		   __vec_zero_pad_to_16(__x), __k, __vec_zero_pad_to_16(__src)));
+      else if constexpr (__impl == _X86CompressImpl::_S_permute)
+	return __x86_permute_by_mask<true, _TV, _Traits>(__x, __k);
+#if __has_builtin(__builtin_ia32_pext_di) && __has_builtin(__builtin_ia32_pdep_di)
+      else if constexpr (__impl == _X86CompressImpl::_S_bmi2)
+	return __x86_bmi2_by_mask<true>(__x, __k);
+#endif
+#if __has_builtin(__builtin_ia32_compresssi512_mask)
+      else if constexpr (sizeof(_Tp) >= 4)
+	{
+	  const auto __k1 = static_cast<_Bitmask<__width_of<_TV>>>(__k);
+	  if constexpr (sizeof(_Tp) == 4)
+	    {
+	      const auto __xi = __vec_bit_cast<int>(__x);
+	      const auto __si = __vec_bit_cast<int>(__src);
+	      if constexpr (sizeof(_TV) == 64)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compresssi512_mask(__xi, __si, __k1));
+	      else if constexpr (sizeof(_TV) == 32)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compresssi256_mask(__xi, __si, __k1));
+	      else
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compresssi128_mask(__xi, __si, __k1));
+	    }
+	  else
+	    {
+	      const auto __xi = __vec_bit_cast<long long>(__x);
+	      const auto __si = __vec_bit_cast<long long>(__src);
+	      if constexpr (sizeof(_TV) == 64)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compressdi512_mask(__xi, __si, __k1));
+	      else if constexpr (sizeof(_TV) == 32)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compressdi256_mask(__xi, __si, __k1));
+	      else
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compressdi128_mask(__xi, __si, __k1));
+	    }
+	}
+#endif
+#if __has_builtin(__builtin_ia32_compressqi512_mask)
+      else
+	{
+	  const auto __k1 = static_cast<_Bitmask<__width_of<_TV>>>(__k);
+	  if constexpr (sizeof(_Tp) == 2)
+	    {
+	      const auto __xi = __vec_bit_cast<short>(__x);
+	      const auto __si = __vec_bit_cast<short>(__src);
+	      if constexpr (sizeof(_TV) == 64)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compresshi512_mask(__xi, __si, __k1));
+	      else if constexpr (sizeof(_TV) == 32)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compresshi256_mask(__xi, __si, __k1));
+	      else
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compresshi128_mask(__xi, __si, __k1));
+	    }
+	  else
+	    {
+	      const auto __xi = __vec_bit_cast<char>(__x);
+	      const auto __si = __vec_bit_cast<char>(__src);
+	      if constexpr (sizeof(_TV) == 64)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compressqi512_mask(__xi, __si, __k1));
+	      else if constexpr (sizeof(_TV) == 32)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compressqi256_mask(__xi, __si, __k1));
+	      else
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_compressqi128_mask(__xi, __si, __k1));
+	    }
+	}
+#else
+      else
+	static_assert(false);
+#endif
+    }
+
+  /** @internal
+   * Moves the leading elements of @p __x to the positions where bit @c i of @p __k is set. With
+   * _S_avx512 the other elements come from @p __src, otherwise they are unspecified.
+   */
+  template <__vec_builtin _TV, _ArchTraits _Traits = {}>
+    [[__gnu__::__always_inline__]]
+    inline _TV
+    __x86_expand(_TV __x, unsigned long long __k, _TV __src = _TV())
+    {
+      constexpr _X86CompressImpl __impl = __x86_compress_impl<_TV, _Traits>();
+      static_assert(__impl != _X86CompressImpl::_S_none);
+      using _Tp = __vec_value_type<_TV>;
+      if constexpr (sizeof(_TV) < 16)
+	return _VecOps<_TV>::_S_extract(
+		 __x86_expand<__vec_builtin_type_bytes<_Tp, 16>, _Traits>(
+		   __vec_zero_pad_to_16(__x), __k, __vec_zero_pad_to_16(__src)));
+      else if constexpr (__impl == _X86CompressImpl::_S_permute)
+	return __x86_permute_by_mask<false, _TV, _Traits>(__x, __k);
+#if __has_builtin(__builtin_ia32_pext_di) && __has_builtin(__builtin_ia32_pdep_di)
+      else if constexpr (__impl == _X86CompressImpl::_S_bmi2)
+	return __x86_bmi2_by_mask<false>(__x, __k);
+#endif
+#if __has_builtin(__builtin_ia32_expandsi512_mask)
+      else if constexpr (sizeof(_Tp) >= 4)
+	{
+	  const auto __k1 = static_cast<_Bitmask<__width_of<_TV>>>(__k);
+	  if constexpr (sizeof(_Tp) == 4)
+	    {
+	      const auto __xi = __vec_bit_cast<int>(__x);
+	      const auto __si = __vec_bit_cast<int>(__src);
+	      if constexpr (sizeof(_TV) == 64)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandsi512_mask(__xi, __si, __k1));
+	      else if constexpr (sizeof(_TV) == 32)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandsi256_mask(__xi, __si, __k1));
+	      else
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandsi128_mask(__xi, __si, __k1));
+	    }
+	  else
+	    {
+	      const auto __xi = __vec_bit_cast<long long>(__x);
+	      const auto __si = __vec_bit_cast<long long>(__src);
+	      if constexpr (sizeof(_TV) == 64)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expanddi512_mask(__xi, __si, __k1));
+	      else if constexpr (sizeof(_TV) == 32)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expanddi256_mask(__xi, __si, __k1));
+	      else
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expanddi128_mask(__xi, __si, __k1));
+	    }
+	}
+#endif
+#if __has_builtin(__builtin_ia32_expandqi512_mask)
+      else
+	{
+	  const auto __k1 = static_cast<_Bitmask<__width_of<_TV>>>(__k);
+	  if constexpr (sizeof(_Tp) == 2)
+	    {
+	      const auto __xi = __vec_bit_cast<short>(__x);
+	      const auto __si = __vec_bit_cast<short>(__src);
+	      if constexpr (sizeof(_TV) == 64)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandhi512_mask(__xi, __si, __k1));
+	      else if constexpr (sizeof(_TV) == 32)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandhi256_mask(__xi, __si, __k1));
+	      else
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandhi128_mask(__xi, __si, __k1));
+	    }
+	  else
+	    {
+	      const auto __xi = __vec_bit_cast<char>(__x);
+	      const auto __si = __vec_bit_cast<char>(__src);
+	      if constexpr (sizeof(_TV) == 64)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandqi512_mask(__xi, __si, __k1));
+	      else if constexpr (sizeof(_TV) == 32)
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandqi256_mask(__xi, __si, __k1));
+	      else
+		return __glibcxx_vec_bit_cast<_TV>(
+			 __builtin_ia32_expandqi128_mask(__xi, __si, __k1));
+	    }
+	}
+#else
+      else
+	static_assert(false);
+#endif
+    }
 } // namespace simd
 _GLIBCXX_END_NAMESPACE_VERSION
 } // namespace std

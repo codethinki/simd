@@ -161,67 +161,345 @@ namespace simd
 #endif
 
   // [simd.permute.mask]
+#if _GLIBCXX_X86
+  /** @internal
+   * Whether __x86_compress_vec and __x86_expand_vec support @p _Vp.
+   */
+  template <typename _Vp, _ArchTraits _Traits = {}>
+    consteval bool
+    __x86_have_compress_vec()
+    {
+      if constexpr (!__simd_vec_type<_Vp> || _Vp::size() > 64)
+	return false;
+      else if constexpr (__complex_like<typename _Vp::value_type>)
+	return false;
+      else if constexpr (_Vp::size() == 1)
+	return true;
+      else if constexpr (_Vp::abi_type::_S_nreg == 1)
+	return __x86_compress_impl<remove_cvref_t<decltype(declval<const _Vp&>()._M_get())>,
+				   _Traits>() != _X86CompressImpl::_S_none;
+      else if constexpr (_Vp::abi_type::_S_nreg == _Vp::size())
+	return false; // one element per register, nothing to gain
+      else
+	return __x86_have_compress_vec<
+		 remove_cvref_t<decltype(declval<const _Vp&>()._M_get_low())>, _Traits>()
+		 && __x86_have_compress_vec<
+		      remove_cvref_t<decltype(declval<const _Vp&>()._M_get_high())>, _Traits>();
+    }
+
+  /** @internal
+   * Whether @p _Vp is a single register with compress and expand instructions, which take the
+   * fill value / original directly.
+   */
+  template <typename _Vp, _ArchTraits _Traits = {}>
+    consteval bool
+    __x86_compress_vec_is_avx512()
+    {
+      if constexpr (!__x86_have_compress_vec<_Vp, _Traits>() || _Vp::size() == 1)
+	return false;
+      else if constexpr (_Vp::abi_type::_S_nreg != 1)
+	return false;
+      else
+	return __x86_compress_impl<remove_cvref_t<decltype(declval<const _Vp&>()._M_get())>,
+				   _Traits>() == _X86CompressImpl::_S_avx512;
+    }
+
+  /** @internal
+   * Stores the selected elements of @p __v at <tt>__out + __offset</tt> and returns the offset
+   * after them. Writes up to _Vp::size() elements, the ones after the selected are unspecified.
+   */
+  template <typename _Vp, _ArchTraits _Traits = {}>
+    [[__gnu__::__always_inline__]]
+    inline int
+    __x86_compress_to(const _Vp& __v, unsigned long long __k, typename _Vp::value_type* __out,
+		      int __offset)
+    {
+      if constexpr (_Vp::size() == 1)
+	{
+	  __out[__offset] = __v[0];
+	  return __offset + int(__k & 1);
+	}
+      else if constexpr (_Vp::abi_type::_S_nreg == 1)
+	{
+	  _Vp::_S_init(__x86_compress<remove_cvref_t<decltype(__v._M_get())>, _Traits>(
+			 __v._M_get(), __k))._M_store(__out + __offset);
+	  return __offset + __builtin_popcountll(__k & (~0ull >> (64 - _Vp::size())));
+	}
+      else
+	{
+	  using _Lo = remove_cvref_t<decltype(__v._M_get_low())>;
+	  __offset = __x86_compress_to<_Lo, _Traits>(__v._M_get_low(), __k, __out, __offset);
+	  return __x86_compress_to<remove_cvref_t<decltype(__v._M_get_high())>, _Traits>(
+		   __v._M_get_high(), __k >> _Lo::size(), __out, __offset);
+	}
+    }
+
+  /** @internal
+   * compress without fill value: the elements after the selected ones are unspecified.
+   */
+  template <typename _Vp, _ArchTraits _Traits = {}>
+    [[__gnu__::__always_inline__]]
+    inline _Vp
+    __x86_compress_vec(const _Vp& __v, unsigned long long __k)
+    {
+      if constexpr (_Vp::size() == 1)
+	return __v;
+      else if constexpr (_Vp::abi_type::_S_nreg == 1)
+	return _Vp::_S_init(__x86_compress<remove_cvref_t<decltype(__v._M_get())>, _Traits>(
+			      __v._M_get(), __k));
+      else
+	{
+	  // every register is stored once at the running offset, the result is loaded once
+	  typename _Vp::value_type __buf[2 * _Vp::size()] = {};
+	  __x86_compress_to<_Vp, _Traits>(__v, __k, __buf, 0);
+	  return _Vp([&](__simd_size_type __i) { return __buf[__i]; });
+	}
+    }
+
+  /** @internal
+   * expand of the elements starting at @p __src.
+   */
+  template <typename _Vp, _ArchTraits _Traits = {}>
+    [[__gnu__::__always_inline__]]
+    inline _Vp
+    __x86_expand_from(const typename _Vp::value_type* __src, unsigned long long __k)
+    {
+      if constexpr (_Vp::size() == 1)
+	return _Vp(__src[0]);
+      else if constexpr (_Vp::abi_type::_S_nreg == 1)
+	{
+	  const _Vp __v([&](__simd_size_type __i) { return __src[__i]; });
+	  return _Vp::_S_init(__x86_expand<remove_cvref_t<decltype(__v._M_get())>, _Traits>(
+				__v._M_get(), __k));
+	}
+      else
+	{
+	  using _Lo = remove_cvref_t<decltype(declval<const _Vp&>()._M_get_low())>;
+	  using _Hi = remove_cvref_t<decltype(declval<const _Vp&>()._M_get_high())>;
+	  const int __n_lo = __builtin_popcountll(__k & ((1ull << _Lo::size()) - 1));
+	  return _Vp::_S_init(__x86_expand_from<_Lo, _Traits>(__src, __k),
+			      __x86_expand_from<_Hi, _Traits>(__src + __n_lo, __k >> _Lo::size()));
+	}
+    }
+
+  /** @internal
+   * expand without original: the elements that are not selected are unspecified.
+   */
+  template <typename _Vp, _ArchTraits _Traits = {}>
+    [[__gnu__::__always_inline__]]
+    inline _Vp
+    __x86_expand_vec(const _Vp& __v, unsigned long long __k)
+    {
+      if constexpr (_Vp::size() == 1)
+	return __v;
+      else if constexpr (_Vp::abi_type::_S_nreg == 1)
+	return _Vp::_S_init(__x86_expand<remove_cvref_t<decltype(__v._M_get())>, _Traits>(
+			      __v._M_get(), __k));
+      else
+	{
+	  typename _Vp::value_type __buf[_Vp::size()];
+	  __v._M_store(__buf);
+	  return __x86_expand_from<_Vp, _Traits>(__buf, __k);
+	}
+    }
+
+  /** @internal
+   * Whether __x86_compress_mask and __x86_expand_mask support @p _Mp.
+   */
+  template <typename _Mp, _ArchTraits _Traits = {}>
+    consteval bool
+    __x86_have_compress_mask()
+    {
+#if __has_builtin(__builtin_ia32_pext_di) && __has_builtin(__builtin_ia32_pdep_di) \
+      && !defined __znver1__ && !defined __znver2__ \
+      && !defined __tune_znver1__ && !defined __tune_znver2__
+      // PEXT/PDEP are microcoded and slow on Zen 1/2
+      return _Mp::size() <= 64 && !_Mp::abi_type::_S_is_cx && _Traits._M_have_bmi2();
+#else
+      return false;
+#endif
+    }
+
+#if __has_builtin(__builtin_ia32_pext_di) && __has_builtin(__builtin_ia32_pdep_di)
+  template <typename _Mp>
+    [[__gnu__::__always_inline__]]
+    inline _Mp
+    __x86_compress_mask(const _Mp& __v, const _Mp& __selector, bool __fill_value)
+    {
+      const unsigned long long __sel = __selector.to_ullong();
+      const int __n = __builtin_popcountll(__sel);
+      unsigned long long __bits = __builtin_ia32_pext_di(__v.to_ullong(), __sel);
+      if (__fill_value && __n < 64)
+	__bits |= ~0ull << __n;
+      return _Mp(__bits);
+    }
+
+  template <typename _Mp>
+    [[__gnu__::__always_inline__]]
+    inline _Mp
+    __x86_expand_mask(const _Mp& __v, const _Mp& __selector, const _Mp& __original)
+    {
+      const unsigned long long __sel = __selector.to_ullong();
+      return _Mp(__builtin_ia32_pdep_di(__v.to_ullong(), __sel)
+		   | (__original.to_ullong() & ~__sel));
+    }
+#endif
+#endif
+
+  /** @internal
+   * Generic compress: every element is written to the next free slot, the slot only advances if
+   * the element is selected.
+   */
   template<__simd_vec_or_mask_type _Vp, typename _Mp>
     constexpr _Vp
     __compress(const _Vp& __v, const _Mp& __selector, const typename _Vp::value_type& __fill_value)
     {
-      __simd_size_type __bit_index[_Vp::size()] = {};
+      typename _Vp::value_type __selected[_Vp::size()];
+      for (__simd_size_type __i = 0; __i < _Vp::size(); ++__i)
+	__selected[__i] = __fill_value;
       __simd_size_type __n = 0;
       for (__simd_size_type __i = 0; __i < _Vp::size(); ++__i)
-	if (__selector[__i])
-	  __bit_index[__n++] = __i;
+	{
+	  __selected[__n] = __v[__i];
+	  __n += __selector[__i];
+	}
+      // the last write may have been an element that is not selected
+      if (__n < _Vp::size())
+	__selected[__n] = __fill_value;
       return _Vp([&](__simd_size_type __i) -> typename _Vp::value_type {
-	       return __i < __n ? __v[__bit_index[__i]] : __fill_value;
+	       return __selected[__i];
 	     });
     }
 
+  /** @internal
+   * Generic expand.
+   */
   template<__simd_vec_or_mask_type _Vp, typename _Mp>
     constexpr _Vp
     __expand(const _Vp& __v, const _Mp& __selector, const _Vp& __original)
     {
-      __simd_size_type __bit_lookup[_Vp::size()] = {};
+      typename _Vp::value_type __elements[_Vp::size()];
+      typename _Vp::value_type __expanded[_Vp::size()];
+      for (__simd_size_type __i = 0; __i < _Vp::size(); ++__i)
+	__elements[__i] = __v[__i];
       __simd_size_type __n = 0;
       for (__simd_size_type __i = 0; __i < _Vp::size(); ++__i)
 	{
-	  __bit_lookup[__i] = __n;
-	  __n += __selector[__i];
+	  const bool __selected = __selector[__i];
+	  // indexing instead of ?: keeps compilers from branching on random masks
+	  const typename _Vp::value_type __choice[2] = {__original[__i], __elements[__n]};
+	  __expanded[__i] = __choice[__selected];
+	  __n += __selected;
 	}
       return _Vp([&](__simd_size_type __i) -> typename _Vp::value_type {
-	       return __selector[__i] ? __v[__bit_lookup[__i]] : __original[__i];
+	       return __expanded[__i];
 	     });
     }
 
   template<__simd_vec_type _Vp>
+    [[__gnu__::__always_inline__]]
     constexpr _Vp
     compress(const _Vp& __v, const typename _Vp::mask_type& __selector)
-    { return __compress(__v, __selector, typename _Vp::value_type()); }
-
-  template<__simd_mask_type _Vp>
-    constexpr _Vp
-    compress(const _Vp& __v, const type_identity_t<_Vp>& __selector)
-    { return __compress(__v, __selector, false); }
+    {
+#if _GLIBCXX_X86
+      if constexpr (__x86_have_compress_vec<_Vp>())
+	if !consteval
+	  {
+	    return __x86_compress_vec(__v, __selector.to_ullong());
+	  }
+#endif
+      return __compress(__v, __selector, typename _Vp::value_type());
+    }
 
   template<__simd_vec_type _Vp>
+    [[__gnu__::__always_inline__]]
     constexpr _Vp
     compress(const _Vp& __v, const typename _Vp::mask_type& __selector,
 	     const typename _Vp::value_type& __fill_value)
-    { return __compress(__v, __selector, __fill_value); }
+    {
+#if _GLIBCXX_X86
+      if constexpr (__x86_have_compress_vec<_Vp>())
+	if !consteval
+	  {
+	    const unsigned long long __k = __selector.to_ullong();
+	    if constexpr (__x86_compress_vec_is_avx512<_Vp>())
+	      return _Vp::_S_init(__x86_compress(__v._M_get(), __k, _Vp(__fill_value)._M_get()));
+	    const int __n = __builtin_popcountll(__k);
+	    const _Vp __r = __x86_compress_vec(__v, __k);
+	    if (__n == _Vp::size())
+	      return __r;
+	    return __select_impl(__iota<_Vp> < typename _Vp::value_type(__n), __r,
+				 _Vp(__fill_value));
+	  }
+#endif
+      return __compress(__v, __selector, __fill_value);
+    }
 
   template<__simd_mask_type _Vp>
+    [[__gnu__::__always_inline__]]
+    constexpr _Vp
+    compress(const _Vp& __v, const type_identity_t<_Vp>& __selector)
+    {
+#if _GLIBCXX_X86
+      if constexpr (__x86_have_compress_mask<_Vp>())
+	if !consteval
+	  {
+	    return __x86_compress_mask(__v, __selector, false);
+	  }
+#endif
+      return __compress(__v, __selector, false);
+    }
+
+  template<__simd_mask_type _Vp>
+    [[__gnu__::__always_inline__]]
     constexpr _Vp
     compress(const _Vp& __v, const type_identity_t<_Vp>& __selector,
 	     const typename _Vp::value_type& __fill_value)
-    { return __compress(__v, __selector, __fill_value); }
+    {
+#if _GLIBCXX_X86
+      if constexpr (__x86_have_compress_mask<_Vp>())
+	if !consteval
+	  {
+	    return __x86_compress_mask(__v, __selector, __fill_value);
+	  }
+#endif
+      return __compress(__v, __selector, __fill_value);
+    }
 
   template<__simd_vec_type _Vp>
+    [[__gnu__::__always_inline__]]
     constexpr _Vp
     expand(const _Vp& __v, const typename _Vp::mask_type& __selector, const _Vp& __original = {})
-    { return __expand(__v, __selector, __original); }
+    {
+#if _GLIBCXX_X86
+      if constexpr (__x86_have_compress_vec<_Vp>())
+	if !consteval
+	  {
+	    if constexpr (__x86_compress_vec_is_avx512<_Vp>())
+	      return _Vp::_S_init(__x86_expand(__v._M_get(), __selector.to_ullong(),
+					       __original._M_get()));
+	    else
+	      return __select_impl(__selector, __x86_expand_vec(__v, __selector.to_ullong()),
+				   __original);
+	  }
+#endif
+      return __expand(__v, __selector, __original);
+    }
 
   template<__simd_mask_type _Vp>
+    [[__gnu__::__always_inline__]]
     constexpr _Vp
     expand(const _Vp& __v, const type_identity_t<_Vp>& __selector, const _Vp& __original = {})
-    { return __expand(__v, __selector, __original); }
+    {
+#if _GLIBCXX_X86
+      if constexpr (__x86_have_compress_mask<_Vp>())
+	if !consteval
+	  {
+	    return __x86_expand_mask(__v, __selector, __original);
+	  }
+#endif
+      return __expand(__v, __selector, __original);
+    }
 
   // [simd.creation] ----------------------------------------------------------
   template<__simd_vec_type _Vp, typename _Ap>
