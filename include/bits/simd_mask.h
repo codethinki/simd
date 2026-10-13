@@ -1926,9 +1926,8 @@ namespace simd
 	[[__gnu__::__always_inline__]]
 	constexpr explicit
 	basic_mask(_Tp __val) noexcept
-	: _M_data0(static_cast<_Bitmask<_N0>>(__val)),
-	  _M_data1(sizeof(_Tp) * __CHAR_BIT__ > _N0
-		     ? static_cast<_Bitmask<_N1>>(__val >> _N0) : _Bitmask<_N1>())
+	: _M_data0(__val),
+	  _M_data1(sizeof(_Tp) * __CHAR_BIT__ > _N0 ? static_cast<_Tp>(__val >> _N0) : _Tp())
 	{}
 
       // [simd.mask.subscr] ---------------------------------------------------

@@ -185,6 +185,8 @@ static_assert(simd::rebind_t<std::float16_t, simd::mask<float>>::abi_type::_S_nr
 // masks with more than 64 elements
 static_assert(simd::mask<complex<float>, 128>(true).to_bitset().all());
 static_assert(simd::mask<complex<float>, 200>(true).to_bitset().all());
+static_assert(simd::mask<int, 200>(0x81u).to_bitset() == std::bitset<200>(0x81u));
+static_assert(simd::mask<float, 129>(~0ull).to_bitset() == std::bitset<129>(~0ull));
 
 template <auto X>
   using Ic = std::integral_constant<std::remove_const_t<decltype(X)>, X>;
