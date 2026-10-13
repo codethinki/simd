@@ -175,13 +175,13 @@ namespace simd
     constexpr bitset<_Np>
     __unwrap_pairs_to_bitset(const __trivial_pair<_T0, _T1>& __p)
     {
-      constexpr size_t _N0 = __bit_floor(_Np);
+      constexpr size_t _N0 = __bit_floor(_Np - 1);
       constexpr size_t _N1 = _Np - _N0;
       static_assert(_N0 % 64 == 0);
       struct _Tmp
       {
-	bitset<__bit_floor(_Np)> _M_lo;
-	bitset<_Np - __bit_floor(_Np)> _M_hi;
+	bitset<_N0> _M_lo;
+	bitset<_N1> _M_hi;
       };
       _Tmp __tmp = {__unwrap_pairs_to_bitset<_N0>(__p._M_first),
 		    __unwrap_pairs_to_bitset<_N1>(__p._M_second)};
