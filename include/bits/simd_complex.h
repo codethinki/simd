@@ -661,7 +661,13 @@ namespace simd
 	[[__gnu__::__always_inline__]]
 	constexpr explicit
 	basic_mask(_Tp __val) noexcept
-	: _M_data(__duplicate_each_bit<_S_size>(__val))
+	: basic_mask([&] [[__gnu__::__always_inline__]] {
+	    // bitset drops the bits beyond _S_size and zero-extends if _Tp has fewer bits
+	    bitset<_S_size> __b(static_cast<unsigned long long>(__val));
+	    if constexpr (_S_size > 64 && sizeof(_Tp) > sizeof(0ull))
+	      __b |= bitset<_S_size>(static_cast<unsigned long long>(__val >> 64)) << 64;
+	    return __b;
+	  }())
 	{}
 
       // [simd.mask.subscr] ---------------------------------------------------

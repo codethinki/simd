@@ -113,4 +113,25 @@ template <typename V>
 	t.verify_equal(-+tr, -tr);
       }
     };
+
+    ADD_TEST(UintCtor) {
+      std::tuple{0x8112'0488'1420'6081ULL, 0xaaaa'aaaa'aaaa'aaaaULL, -1ULL, 0ULL},
+      [](auto& t, const auto... values) {
+	// element i is bit i of the value; false if the type of the value has no bit i
+	const auto check = [&]<typename U>(const U x) {
+	  const M ref([&](int i) {
+	    return i < std::numeric_limits<U>::digits && ((x >> i) & 1) != 0;
+	  });
+	  t.verify_equal(M(x), ref)("{} bits: {:x}", std::numeric_limits<U>::digits, x);
+	};
+	for (const unsigned long long x : {values...})
+	  {
+	    check(static_cast<unsigned char>(x));
+	    check(static_cast<unsigned short>(x));
+	    check(static_cast<unsigned int>(x));
+	    check(static_cast<unsigned long>(x));
+	    check(x);
+	  }
+      }
+    };
   };
